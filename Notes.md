@@ -2592,3 +2592,37 @@ Splash format literal 0x420011a4 (only user: `l32r` at 0x42019395 in Boot__showS
 - Dead custom code still in the image: 0x42053818 (old set-param hook), 0x4205398f-0x420539df (old text-only envelope cycler), 0x42054800 (Stage 1-10 init), 0x42054900 (Stage 4-10 stereo process), plus the IROM string and table copies superseded in Stage 11.
 - Correction to the Stage 12 note: `CustomADSR__selectHook` receives the event type (always 3 on its active path), not the encoder direction. The envelope order is therefore fixed (AMP -> FILTER -> WAVE) whichever way Select turns.
 - Static findings, kept on backburner by the owner: (a) `CustomADSR__labelDraw` 0x42054680 does not forward Text__draw's stack inverse flag (it reads the wrapper's uninitialised [a1+0]), so the envelope name may sometimes render inverted; (b) the factory dispatcher routes a Select turn to the shown EnvGroup before the hook runs, so the turn may also change the last-edited stage by 0.01 per detent. Neither has been observed at runtime.
+
+## Stage 17 - selectable latch count (13 November 2026)
+
+Latch rewritten in C and appended at 0x42055020 (`latch_note_on` 0x420550b4, `latch_note_off` 0x42055290, `latch_ui_button` 0x42055340); NoteProcessor vtable slots 0x3c070124/0x3c070128 and the UI__onButton call at 0x4201d96f repointed. RTC 0x50000020 = capacity 0-4. Press cycle Off -> Latch 1 -> 2 -> 3 -> 4 -> Off with notices "Latch 1-4" / "Latch Off" from RTC 0x500005d0-0x500005f9.
+- Corrections found while reading the old latch: (1) `Latch__captureHeldNotes` 0x42053488 keeps the 4 OLDEST held notes by note-on time, not the newest (the map row written on 2026-11-12 said "most recent"); (2) the eviction fragment 0x42054200 stores at a1+32..44 inside the note-on hook's window-overflow save area, so a spill during the eviction note-off could corrupt state. Both are retired with the old code.
+- Host test of latch.c with a mock NoteProcessor passed all scripted cases. Output `PROTEIN_STAGE17_HW_CANDIDATE_LATCH_COUNT.UF2`, SHA-256 `dedc499300ccabeb02d72cf780ed3f57117646ee02f22bfcfdccd8764e4ff8e1`. Not yet emulator- or hardware-tested.
+
+## Stage 18 - Flavour compressor: AutoGain off, 4 ms attack, smoothing (13 November 2026)
+
+AutoGain byte +0x80 = 0 and attack `0x3f72f9fa` (4 ms) set in `CustomCompressorHW__init` 0x42054c24. Flavour is smoothed per block in `CustomCompressorHW__stereoProcess` 0x42054c6c (k 0.017977, 20 ms; RTC float 0x500000f8). Output gain mapping unchanged (0 to -8 dB). Output `PROTEIN_STAGE18_HW_CANDIDATE_FLAVOUR_SMOOTH.UF2`, SHA-256 `53a8ef540135748d1ed83ee866e6a179f90a83fac4c91921883e6609bb910293`. Static validation only.
+
+## Stage 19 - Flavour output gain 0 to +15 dB (13 November 2026)
+
+Mapper slope literal 0x42054844 -> 0xbe800000 (-0.25): output gain +15 x Flavour dB (was -8 x). Output `PROTEIN_STAGE19_HW_CANDIDATE_OUTGAIN_PLUS15.UF2`, SHA-256 `30312da7d7fc2ea7248e5ff91541c2d65a19a87469e6ebeb386908de7e8e3d7a`. Static validation only.
+
+## Correction and Stage 20 - Flavour IS used by the factory voices (13 November 2026)
+
+Corrects Round 15 ("no consumer"), Round 33 ("closed enumeration") and Round 45 ("part+0x10 stays null, q = 0"), and the same claims repeated in this project on 12-13 November. Found after the owner reproduced per-note pitch/timbre changes at high Flavour on the factory UF2 in the emulator.
+- The "part" whose +0x10 holds the q pointer is the shared VoiceEngine object (base 0x3fcbdcc4, stride 0x4074). Its vtable 0x3c071148 slot +0x14 is the setter 0x4204e8a0 (`s32i.n a3, a2, 16`). `fcn.4201476c` (vtable 0x3c07020c) stores its argument at manager+0xcac and calls that setter on manager+4. `ParamMgr__loadDefaults` 0x4201584c calls `fcn.4201476c` for layers 0-3 with engine+0x32ec, the engine parameter array. So q = entry 20 = Flavour (engine id 0x14). Round 45 searched only for stores through pointers loaded from offsets 4 or 8 in engine/voice code and missed this virtual setter.
+- Readers (each null-checked): Voice__trigger 0x4037b645, Voice__render 0x4037bfcb, VoiceEngine__controlTick 0x4037e74f. Effects as in Round-series notes for q, now confirmed live: per-note random wavetable scan offset (osc 1 and 2, up to about 25 q), osc 1 pitch offset (up to 0.1 q), cutoff offset (up to 0.1 q); tick jitter when q > 0.25; envelope stepping once per 8 ticks when q >= 0.5.
+- Stage 20 disables it: 0x4204e8a3 `s32i.n a3,a2,16` -> `nop.n`. Output `PROTEIN_STAGE20_HW_CANDIDATE_NO_FLAVOUR_RANDOM.UF2`, SHA-256 `e936603a29e33b5e1c056006527b140d9b10771329b928aed71ad517f6478d2c`. Static validation only.
+- Lesson: an address/offset scan cannot rule out reads through stored array pointers; check for setters that publish whole parameter arrays.
+
+## Stage 21 - aggressive Flavour compressor curve (13 November 2026)
+
+`flavour_map` (C, 0x420555a0) replaces the asm mapper: threshold -50x dB, ratio 1 + 99x^3, output gain 50x(1 - 1/R) - 6 sqrt(x) dB (OutGain ramp v may exceed 1; Compressor__process applies -30 + 60v without a clamp and Db__toLinear covers up to +100 dB, checked), attack 4 ms x 0.025^x, release 300 ms x 0.05^x, recomputed when x moves > 0.0005. __divsf3 resolved to ROM 0x40002274 (ESP-IDF 5.5.1 esp32s3.rom.libgcc.ld). Output `PROTEIN_STAGE21_HW_CANDIDATE_FLAVOUR_DESTROY.UF2`, SHA-256 `e867f9a47ada22c728c6307fb44dad8edd9de4a0f36a8bebc2f239b8936141f9`. Static validation only.
+
+## Stage 22 - Flavour release 300 -> 100 ms (13 November 2026)
+
+`flavour_map` release = 300 ms x (1/3)^x (literal 0x42055580 = 0.33333334). Output `PROTEIN_STAGE22_HW_CANDIDATE_REL300_100.UF2`, SHA-256 `491e81f276e2f368a47e7d04b77a09da0dd702248a934b17cd6292a6383618de`. Static validation only.
+
+## Stage 23 - own C Flavour compressor (13 November 2026)
+
+`fcomp_block` (fcomp.c, 0x420557a4, 0x428 bytes from 0x42055724) replaces the call to `CustomCompressorHW__stereoProcess` at 0x42054a39; the stock `Compressor__process` is no longer used for Flavour. Reason: stepped gain (every 4 samples) and a positive-peak-only detector produced inharmonic noise on decaying high notes. fcomp uses a two-polarity peak detector held over 40 samples, dB-domain attack/release smoothing, per-sample linear gain ramps and a 40-sample lookahead delay. Same curves as Stage 22. State: 616 bytes inside the block published at 0x500000fc, guarded by magic 0x464c4156. Only external calls: powf 0x4203d85c (on parameter change) and ROM __divsf3 0x40002274. Output `PROTEIN_STAGE23_HW_CANDIDATE_CUSTOM_COMPRESSOR.UF2`, SHA-256 `507fd07e22e2ed0863820b7b718352f5bd20198ec615bace11c663ea68e9dcc3`. Static validation only.
